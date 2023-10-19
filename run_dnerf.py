@@ -387,6 +387,7 @@ def config_parser():
     return parser
 
 
+
 class train(LightningModule):
 
     
@@ -593,7 +594,7 @@ class train(LightningModule):
             else:
                 self.images = self.images[...,:3]
 
-            # images = [rgb2hsv(img) for img in images]
+            # self.images = [rgb2hsv(img) for img in images]
 
         else:
             print('Unknown dataset type', args.dataset_type, 'exiting')
@@ -613,8 +614,13 @@ class train(LightningModule):
             self.render_times = np.array(self.times[self.i_test])
 
     def train_dataloader(self):
-        return DataLoader(self.i_train, num_workers=3, batch_size=self.args.batch_size)
+        return DataLoader(self.i_train, num_workers=3, batch_size=self.args.batch_size, pin_memory=True)
 
+    def val_dataloader(self):
+        return DataLoader(self.i_val, shuffle=False, num_workers=3, batch_size=1, pin_memory=True)
+
+    def validation_step():
+        pass
 
     def forward(self, args, rays_rgb, i_batch, N_rand):
 
@@ -725,7 +731,7 @@ class train(LightningModule):
             param_group['lr'] = new_lrate
         ################################
         """
-        return [rgb, disp, acc, extras]
+        return rgb, disp, acc, extras, target_s, extras_prev, extras_next, frame_time_prev, frame_time_next
 
     def training_setp(self):
         log = {'lr': self.args.lrate}
@@ -773,10 +779,10 @@ class train(LightningModule):
             i_batch = 0
 
         # call forward function
-        result = self(rays_rgb, i_batch, N_rand)
+        rgb, disp, acc, extras, target_s, extras_prev, extras_next, frame_time_prev, frame_time_next = self(rays_rgb, i_batch, N_rand)
         
         # calc loss
-        optimizer.zero_grad()
+
         img_loss = img2mse(rgb, target_s)
         tv_loss = 0
         if args.add_tv_loss:
@@ -792,20 +798,28 @@ class train(LightningModule):
 
         loss = img_loss + tv_loss
         psnr = mse2psnr(img_loss)
+        log['train/loss'] = loss
 
         if 'rgb0' in extras:
             img_loss0 = img2mse(extras['rgb0'], target_s)
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
 
+        
+        with torch.no_grad():
+            psnr = mse2psnr(img_loss)
+            log['train/psnr']= psnr
+        
+        return {'loss': loss, 'log': log}
+
+        """
         if args.do_half_precision:
             with amp.scale_loss(loss, optimizer) as scaled_loss:
                 scaled_loss.backward()
         else:
             loss.backward()
-
-        optimizer.step()
-
+        """
+   
         
 
         
@@ -813,6 +827,32 @@ class train(LightningModule):
 
 
 if __name__=='__main__':
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    # torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
-    train()
+    nerf = train()
+
+    if nerf.args.ft_path is not None and nerf.args.ft_path!='None':
+            ckpts = ModelCheckpoint(nerf.ft_path, monitor='val/loss', mode='min')
+    else:
+        ckpts = ModelCheckpoint((os.path.join(nerf.args.basedir, nerf.args.expname, f) for f in sorted(os.listdir(os.path.join(nerf.args.basedir, nerf.args.expname))) if 'tar' in f), monitor='val/loss', mode='min')
+                                
+    
+    logger = TestTubeLogger(
+        save_dir='logs',
+        name=nerf.expname,
+        debug=False,
+        create_git_tag=False
+    )
+
+    trainer = Trainer(max_epochs=nerf.args.N_rand,
+                      checkpoint_callback=ckpts,
+                      logger=logger,
+                      early_stop_callback=None,
+                      weights_summary=None,
+                      progress_bar_refresh_rate=1,
+                      gpus=4,
+                      distributed_backend='ddp',
+                      num_sanity_val_steps=1,
+                      benchmark=True,
+                      profiler=True)
+    trainer.fit(nerf)
